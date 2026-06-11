@@ -1,3 +1,9 @@
 opencv-python
 numpy
+pytesseract
+easyocr
+pillow
+torch
+torchvision
+rapidfuzz
 # conda activate abdulkyc

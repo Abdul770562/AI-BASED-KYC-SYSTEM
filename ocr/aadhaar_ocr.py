@@ -3,6 +3,8 @@ Production-level Aadhaar Card OCR
 Handles poor lighting, skew, blur, glare, and low-res photos.
 """
 
+from email.mime import text
+
 import cv2
 import numpy as np
 import pytesseract
@@ -12,6 +14,14 @@ import platform
 from dataclasses import dataclass, field
 from typing import Optional
 from PIL import Image, ImageEnhance, ImageFilter
+import cv2
+from PIL import Image
+import torch
+
+from transformers import (
+    DonutProcessor,
+    VisionEncoderDecoderModel
+)
 
 
 # ── Tesseract path (auto-detected) ───────────────────────────────────────────
@@ -216,25 +226,95 @@ class ImageProcessor:
 
 # ── OCR runner ────────────────────────────────────────────────────────────────
 
-class OCREngine:
-    # Tesseract configs to try (order matters — faster/simpler first)
-    CONFIGS = [
-        "--oem 3 --psm 4",   # single column of text
-        "--oem 3 --psm 6",   # uniform block of text
-        "--oem 3 --psm 11",  # sparse text
-        "--oem 1 --psm 6",   # LSTM only
-    ]
+# class OCREngine:
+#     # Tesseract configs to try (order matters — faster/simpler first)
+#     CONFIGS = [
+#         "--oem 3 --psm 4",   # single column of text
+#         "--oem 3 --psm 6",   # uniform block of text
+#         "--oem 3 --psm 11",  # sparse text
+#         "--oem 1 --psm 6",   # LSTM only
+#     ]
 
-    def run(self, gray: np.ndarray) -> str:
-        best = ""
-        for cfg in self.CONFIGS:
-            try:
-                text = pytesseract.image_to_string(gray, lang="eng", config=cfg)
-                if len(text.strip()) > len(best.strip()):
-                    best = text
-            except Exception:
-                pass
-        return best
+#     def run(self, gray: np.ndarray) -> str:
+#         best = ""
+#         for cfg in self.CONFIGS:
+#             try:
+#                 text = pytesseract.image_to_string(gray, lang="eng", config=cfg)
+#                 if len(text.strip()) > len(best.strip()):
+#                     best = text
+#             except Exception:
+#                 pass
+#         return best
+
+class DonutEngine:
+
+    def __init__(self):
+
+        self.processor = DonutProcessor.from_pretrained(
+            "naver-clova-ix/donut-base"
+        )
+
+        self.model = VisionEncoderDecoderModel.from_pretrained(
+            "naver-clova-ix/donut-base"
+        )
+
+        self.device = (
+            "cuda"
+            if torch.cuda.is_available()
+            else "cpu"
+        )
+
+        self.model.to(self.device)
+
+    def run(self, image):
+
+        if len(image.shape) == 2:
+            image = cv2.cvtColor(
+                image,
+                cv2.COLOR_GRAY2RGB
+            )
+        else:
+            image = cv2.cvtColor(
+                image,
+                cv2.COLOR_BGR2RGB
+            )
+
+        pil_image = Image.fromarray(image)
+
+        pixel_values = self.processor(
+            pil_image,
+            return_tensors="pt"
+        ).pixel_values
+
+        pixel_values = pixel_values.to(
+            self.device
+        )
+
+        task_prompt = "<s>"
+
+        decoder_input_ids = self.processor.tokenizer(
+            task_prompt,
+            add_special_tokens=False,
+            return_tensors="pt"
+        ).input_ids.to(self.device)
+
+        outputs = self.model.generate(
+            pixel_values,
+            decoder_input_ids=decoder_input_ids,
+            max_length=1024,
+            early_stopping=True,
+            pad_token_id=self.processor.tokenizer.pad_token_id,
+            eos_token_id=self.processor.tokenizer.eos_token_id,
+            use_cache=True,
+            num_beams=3
+        )
+
+        text = self.processor.batch_decode(
+            outputs,
+            skip_special_tokens=True
+        )[0]
+
+        return text
 
 
 # ── Field extractors ─────────────────────────────────────────────────────────
@@ -414,7 +494,7 @@ class AadhaarOCR:
     def __init__(self, debug: bool = False):
         self.debug = debug
         self.processor = ImageProcessor()
-        self.engine = OCREngine()
+        self.engine = DonutEngine()
         self.extractor = FieldExtractor()
 
     # ── public API ────────────────────────────────────────────────────────────
@@ -430,6 +510,10 @@ class AadhaarOCR:
             text = self.engine.run(variant)
             if not text.strip():
                 continue
+
+            print("\nDONUT OUTPUT:\n")
+            print(text)
+            print("\n------------------\n")
 
             result = self._extract_all(text, strategy_name)
 
